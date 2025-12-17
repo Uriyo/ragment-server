@@ -1,4 +1,3 @@
-## 09_Retrieval
 
 ### Setup
 
