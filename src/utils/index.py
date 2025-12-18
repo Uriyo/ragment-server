@@ -11,3 +11,4 @@ def validate_url(url_string: str) -> bool:
     except Exception:
         # Catch any parsing errors for malformed URLs
         return False
+

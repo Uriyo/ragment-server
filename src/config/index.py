@@ -11,6 +11,21 @@ if not os.getenv("SUPABASE_API_URL") or not os.getenv("SUPABASE_SECRET_KEY"):
 if not os.getenv("CLERK_SECRET_KEY") or not os.getenv("DOMAIN"):
     raise ValueError("CLERK_SECRET_KEY and DOMAIN must be set in .env file")
 
+if not os.getenv("STRIPE_SECRET_KEY"):
+    raise ValueError("STRIPE_SECRET_KEY must be set in .env file")
+
+# if not os.getenv("STRIPE_WEBHOOK_SECRET"):
+#     raise ValueError("STRIPE_WEBHOOK_SECRET must be set in .env file")
+
+if not os.getenv("STRIPE_PRODUCT_ID_HOBBY"):
+    raise ValueError("STRIPE_PRODUCT_ID_HOBBY must be set in .env file")
+
+if not os.getenv("STRIPE_PRODUCT_ID_PRO"):
+    raise ValueError("STRIPE_PRODUCT_ID_PRO must be set in .env file")
+
+if not os.getenv("STRIPE_PUBLISHABLE_KEY"):
+    raise ValueError("STRIPE_PUBLISHABLE_KEY must be set in .env file")
+
 
 if (
     not os.getenv("S3_BUCKET_NAME")
