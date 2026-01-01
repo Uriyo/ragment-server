@@ -9,12 +9,13 @@ import os
 from src.config.index import appConfig
 from src.services.supabase import supabase
 from datetime import datetime
+import stripe 
 
 router = APIRouter(tags=["stripeRoutes"])
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-DOMAIN = 'http://localhost:3000'
-os.getenv("DOMAIN") 
+DOMAIN = appConfig["domain"]
+
 
 
 
@@ -47,30 +48,52 @@ def create_checkout_session(body: CheckoutRequest, clerk_user=Depends(get_curren
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("Stripe-Signature")
+
     try:
         event = stripe.Webhook.construct_event(
-            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
+            payload, sig_header, appConfig["stripe_webhook_secret"]
         )
     except Exception as e:
         return {"status": "error"}
+    
+    event_type = event['type']
 
-    if event["type"] == "checkout.session.completed":
+    if event_type == "checkout.session.completed":
+
         session = event["data"]["object"]
 
         clerk_user_id = session["metadata"]["clerk_user_id"]
         subscription_id = session["subscription"]
         customer_id = session["customer"]
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        status = subscription["status"]
+           
+
+        current_period_end = subscription["items"]["data"][0]["current_period_end"]
+        
+        readableDate = datetime.fromtimestamp(current_period_end).strftime("%Y-%m-%d %H:%M:%S") # This is not used anywhere
+        print(readableDate)
+
+        price_id = subscription["items"]["data"][0]["price"]["id"]
+
+        PLAN_BY_PRICE_ID = {
+            "price_1Sfi6LSC6OSw12xOJIdFTYKk": "hobby",
+            "price_1Sfi6pSC6OSw12xOTbyvt0dN": "pro",
+        }
+        plan = PLAN_BY_PRICE_ID.get(price_id, "free")
 
         sub = stripe.Subscription.retrieve(subscription_id)
-
-        update_subscription(
-            clerk_user_id=clerk_user_id,
-            stripe_customer_id=customer_id,
-            stripe_subscription_id=subscription_id,
-            plan=sub["items"]["data"][0]["price"]["nickname"].lower(),
-            status=sub["status"],
-            current_period_end=datetime.fromtimestamp(sub["current_period_end"])
-        )
+        try:
+            update_subscription(
+                clerk_user_id=clerk_user_id,
+                stripe_customer_id=customer_id,
+                stripe_subscription_id=subscription_id,
+                plan=plan,
+                status=status,
+                current_period_end=readableDate
+            )
+        except Exception as e:
+            print("Error updating subscription:", e)
 
     return {"status": "success"}
 
@@ -83,17 +106,24 @@ def update_subscription(clerk_user_id,stripe_customer_id,stripe_subscription_id,
     print("Plan:", plan)
     print("Status:", status)
     print("Current Period End:", current_period_end)
-
-    result = supabase.table("subscriptions").upsert({
-        "stripe_customer_id": stripe_customer_id,
-        "stripe_subscription_id": stripe_subscription_id,
-        "plan": plan,
-        "status": status,
-        "current_period_end": current_period_end
-    }).eq("clerk_user_id", clerk_user_id).execute()
-
-    if result.error:
-        print("Error updating subscription:", result.error)
-    else:
-        print("Subscription updated successfully.")
+    try:
+        result = (
+        supabase
+        .table("subscriptions")
+        .upsert(
+            {
+                "clerk_user_id": clerk_user_id,
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_subscription_id": stripe_subscription_id,
+                "plan": plan,
+                "status": status,
+                "current_period_end": current_period_end,
+            },
+            on_conflict="clerk_user_id",  
+        )
+        .execute()
+        )
+    except Exception as e:
+        print("Error updating subscription:", e)
+        return {"error": str(e)}
     return result.data[0] if result.data else None

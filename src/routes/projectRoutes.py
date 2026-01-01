@@ -1,254 +1,46 @@
 from fastapi import APIRouter, HTTPException, Depends
 from src.services.supabase import supabase
 from src.services.clerkAuth import get_current_user_clerk_id
-from src.models.index import ProjectCreate, ProjectSettings
-from src.agents.simple_agent.agent import create_simple_rag_agent
-from src.agents.supervisor_agent.agent import create_supervisor_agent
-from src.models.index import MessageCreate, MessageRole
-from src.rag.retrieval.index import retrieve_context
-from src.rag.retrieval.utils import prepare_prompt_and_invoke_llm , get_chat_history
+from src.models.index import FileUploadRequest, ProcessingStatus, UrlRequest
+from src.utils.index import validate_url
+from src.config.index import appConfig
+from src.services.awsS3 import s3_client
+import uuid
+from src.services.celery import perform_rag_ingestion_task
+from src.config.logging import get_logger, set_project_id, set_user_id
 
-router = APIRouter(tags=["projectRoutes"])
+logger = get_logger(__name__)
+
+router = APIRouter(tags=["projectFilesRoutes"])
+
 """
 `/api/projects`
 
-  - GET `/api/projects/` ~ List all projects
-  - POST `/api/projects/` ~ Create a new project
-  - DELETE `/api/projects/{project_id}` ~ Delete a specific project
-  
-  - GET `/api/projects/{project_id}` ~ Get specific project data
-  - GET `/api/projects/{project_id}/chats` ~ Get specific project chats
-  - GET `/api/projects/{project_id}/settings` ~ Get specific project settings
-  
-  - PUT `/api/projects/{project_id}/settings` ~ Update specific project settings
-  - POST `/api/projects/{project_id}/chats/{chat_id}/messages` ~ Send a message to a Specific Chat
-  
+  - GET `/{project_id}/files` ~ List all project files
+  - POST `/{project_id}/files/upload-url` ~ Generate presigned url for file upload for frontend
+  - POST `/{project_id}/files/confirm` ~ Confirmation of file upload to S3
+  - POST `/{project_id}/urls` ~ Add website URL to database
+  - DELETE `/{project_id}/files/{file_id}` ~ Delete document from s3 and database
+  - GET `/{project_id}/files/{file_id}/chunks` ~ Get project document chunks
 """
 
 
-@router.get("/")
-async def get_projects(current_user_clerk_id: str = Depends(get_current_user_clerk_id)):
-    """
-    ! Logic Flow
-    * 1. Get current user clerk_id
-    * 2. Query projects table for projects related to the current user
-    * 3. Return projects data
-    """
-    try:
-        projects_query_result = (
-            supabase.table("projects")
-            .select("*")
-            .eq("clerk_id", current_user_clerk_id)
-            .execute()
-        )
-
-        return {
-            "message": "Projects retrieved successfully",
-            "data": projects_query_result.data or [],
-        }
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while fetching projects: {str(e)}",
-        )
-
-
-@router.post("/")
-async def create_project(
-    project_data: ProjectCreate,
-    current_user_clerk_id: str = Depends(get_current_user_clerk_id),
-):
-    """
-    ! Logic Flow
-    * 1. Get current user clerk_id
-    * 2. Insert new project into database
-    * 3. Check if project creation failed, then return error
-    * 4. Create default project settings for the new project
-    * 5. Check if project settings creation failed, then rollback the project creation
-    * 6. Return newly created project data
-    """
-    try:
-        # Insert new project into database
-        project_insert_data = {
-            "name": project_data.name,
-            "description": project_data.description,
-            "clerk_id": current_user_clerk_id,
-        }
-
-        project_creation_result = (
-            supabase.table("projects").insert(project_insert_data).execute()
-        )
-
-        if not project_creation_result.data:
-            raise HTTPException(
-                status_code=422,
-                detail="Failed to create project - invalid data provided",
-            )
-
-        newly_created_project = project_creation_result.data[0]
-
-        # Create default project settings for the new project
-        project_settings_data = {
-            "project_id": newly_created_project["id"],
-            "embedding_model": "text-embedding-3-large",
-            "rag_strategy": "basic",
-            "agent_type": "agentic",
-            "chunks_per_search": 10,
-            "final_context_size": 5,
-            "similarity_threshold": 0.3,
-            "number_of_queries": 5,
-            "reranking_enabled": True,
-            "reranking_model": "reranker-english-v3.0",
-            "vector_weight": 0.7,
-            "keyword_weight": 0.3,
-        }
-
-        project_settings_creation_result = (
-            supabase.table("project_settings").insert(project_settings_data).execute()
-        )
-
-        if not project_settings_creation_result.data:
-            # Rollback: Delete the project if settings creation fails
-            supabase.table("projects").delete().eq(
-                "id", newly_created_project["id"]
-            ).execute()
-            raise HTTPException(
-                status_code=422,
-                detail="Failed to create project settings - project creation rolled back",
-            )
-
-        return {
-            "message": "Project created successfully",
-            "data": newly_created_project,
-        }
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal server error occurred while creating project: {str(e)}",
-        )
-
-
-@router.delete("/{project_id}")
-async def delete_project(
+@router.get("/{project_id}/files")
+async def get_project_files(
     project_id: str, current_user_clerk_id: str = Depends(get_current_user_clerk_id)
 ):
     """
     ! Logic Flow
     * 1. Get current user clerk_id
-    * 2. Verify if the project exists and belongs to the current user
-    * 3. Delete project - CASCADE will automatically delete all related data:
-    * 4. Check if project deletion failed, then return error
-    * 5. Return successfully deleted project data
+    * 2. Select all project documents from the project documents table for given project_id
+    * 3. Return project documents data
     """
+    set_project_id(project_id)
+    set_user_id(current_user_clerk_id)
     try:
-        # Verify if the project exists and belongs to the current user
-        project_ownership_verification_result = (
-            supabase.table("projects")
-            .select("id")
-            .eq("id", project_id)
-            .eq("clerk_id", current_user_clerk_id)
-            .execute()
-        )
-
-        if not project_ownership_verification_result.data:
-            raise HTTPException(
-                status_code=404,  # Not Found - project doesn't exist or doesn't belong to user
-                detail="Project not found or you don't have permission to delete it",
-            )
-
-        # Delete project ~ "CASCADE" will automatically delete all related data: project_settings, project_documents, document_chunks, chats, messages, etc.
-        project_deletion_result = (
-            supabase.table("projects")
-            .delete()
-            .eq("id", project_id)
-            .eq("clerk_id", current_user_clerk_id)
-            .execute()
-        )
-
-        if not project_deletion_result.data:
-            raise HTTPException(
-                status_code=500,  # Internal Server Error - deletion failed unexpectedly
-                detail="Failed to delete project - please try again",
-            )
-
-        successfully_deleted_project = project_deletion_result.data[0]
-
-        return {
-            "message": "Project deleted successfully",
-            "data": successfully_deleted_project,
-        }
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal server error occurred while deleting project: {str(e)}",
-        )
-
-
-@router.get("/{project_id}")
-async def get_project(
-    project_id: str, current_user_clerk_id: str = Depends(get_current_user_clerk_id)
-):
-    """
-    ! Logic Flow
-    * 1. Get current user clerk_id
-    * 2. Verify if the project exists and belongs to the current user
-    * 3. Return project data
-    """
-    try:
-        project_result = (
-            supabase.table("projects")
-            .select("*")
-            .eq("id", project_id)
-            .eq("clerk_id", current_user_clerk_id)
-            .execute()
-        )
-
-        if not project_result.data:
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found or you don't have permission to access it",
-            )
-
-        return {
-            "message": "Project retrieved successfully",
-            "data": project_result.data[0],
-        }
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal server error occurred while retrieving project: {str(e)}",
-        )
-
-
-@router.get("/{project_id}/chats")
-async def get_project_chats(
-    project_id: str, current_user_clerk_id: str = Depends(get_current_user_clerk_id)
-):
-    """
-    ! Logic Flow
-    * 1. Get current user clerk_id
-    * 2. Verify if the project exists and belongs to the current user
-    * 3. Return project chats data
-    """
-    try:
-        project_chats_result = (
-            supabase.table("chats")
+        logger.info("fetching_project_files")
+        project_files_result = (
+            supabase.table("project_documents")
             .select("*")
             .eq("project_id", project_id)
             .eq("clerk_id", current_user_clerk_id)
@@ -256,80 +48,45 @@ async def get_project_chats(
             .execute()
         )
 
-        # * If there are no chats for the project, return an empty list
-        # * A User may or may not have any chats for a project
+        # * If there are no project documents for the project, return an empty list
+        # * A User may or may not have any project files.
 
+        logger.info("project_files_retrieved", file_count=len(project_files_result.data or []))
         return {
-            "message": "Project chats retrieved successfully",
-            "data": project_chats_result.data or [],
+            "message": "Project files retrieved successfully",
+            "data": project_files_result.data or [],
         }
 
     except HTTPException as e:
         raise e
 
     except Exception as e:
+        logger.error("project_files_retrieval_error", error=str(e), exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"An internal server error occurred while retrieving project {project_id} chats: {str(e)}",
+            detail=f"An internal server error occurred while retrieving project {project_id} files: {str(e)}",
         )
 
 
-@router.get("/{project_id}/settings")
-async def get_project_settings(
-    project_id: str, current_user_clerk_id: str = Depends(get_current_user_clerk_id)
-):
-    """
-    ! Logic Flow
-    * 1. Get current user clerk_id
-    * 2. Verify if the project exists and belongs to the current user
-    * 3. Check if the project settings exists for the project
-    * 4. Return project settings data
-    """
-    try:
-        project_settings_result = (
-            supabase.table("project_settings")
-            .select("*")
-            .eq("project_id", project_id)
-            .execute()
-        )
-
-        if not project_settings_result.data:
-            raise HTTPException(
-                status_code=404,
-                detail="Project settings not found or you don't have permission to access it",
-            )
-
-        return {
-            "message": "Project settings retrieved successfully",
-            "data": project_settings_result.data[0],
-        }
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal server error occurred while retrieving project {project_id} settings: {str(e)}",
-        )
-
-
-@router.put("/{project_id}/settings")
-async def update_project_settings(
+@router.post("/{project_id}/files/upload-url")
+async def get_upload_presigned_url(
     project_id: str,
-    settings: ProjectSettings,
+    file_upload_request: FileUploadRequest,
     current_user_clerk_id: str = Depends(get_current_user_clerk_id),
 ):
     """
-    ! Logic Flow
-    * 1. Get current user clerk_id
-    * 2. Verify if the project exists and belongs to the current user
-    * 3. Verify if the project settings exist for the project
-    * 4. Update project settings
-    * 5. Check if project settings update failed, then return error
-    * 6. Return successfully updated project settings data
+    ! Logic Flow:
+    * 1. Verify project exists and belongs to the current user
+    * 2. Generate s3 key
+    * 3. Generate upload presigned url (will expire in 1 hour)
+    * 4. Create project document record with pending status
+    * 5. Return presigned url
     """
+    set_project_id(project_id)
+    set_user_id(current_user_clerk_id)
     try:
+        logger.info("generating_upload_url", filename=file_upload_request.filename, file_size=file_upload_request.file_size)
+        # Verify project exists and belongs to the current user
         project_ownership_verification_result = (
             supabase.table("projects")
             .select("id")
@@ -339,141 +96,74 @@ async def update_project_settings(
         )
 
         if not project_ownership_verification_result.data:
+            logger.warning("project_not_found_for_upload")
             raise HTTPException(
                 status_code=404,
-                detail="Project not found or you don't have permission to update its settings",
+                detail="Project not found or you don't have permission to upload files to this project",
             )
 
-        project_settings_ownership_verification_result = (
-            supabase.table("project_settings")
-            .select("id")
-            .eq("project_id", project_id)
+        # Generate s3 key
+        file_extension = (
+            file_upload_request.filename.split(".")[-1]
+            if "." in file_upload_request.filename
+            else ""
+        )
+        unique_file_id = uuid.uuid4()
+        s3_key = (
+            f"projects/{project_id}/documents/{unique_file_id}.{file_extension}"
+            if file_extension
+            else f"projects/{project_id}/documents/{unique_file_id}"
+        )
+
+        # Generate upload presigned url (will expire in 1 hour)
+        presigned_url = s3_client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": appConfig["s3_bucket_name"],
+                "Key": s3_key,
+                "ContentType": file_upload_request.file_type,
+            },
+            ExpiresIn=3600,  # 1 hour
+        )
+
+        if not presigned_url:
+            logger.error("presigned_url_generation_failed", s3_key=s3_key)
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to generate upload presigned url",
+            )
+
+        # Generate database record with pending status
+        document_creation_result = (
+            supabase.table("project_documents")
+            .insert(
+                {
+                    "project_id": project_id,
+                    "filename": file_upload_request.filename,
+                    "s3_key": s3_key,
+                    "file_size": file_upload_request.file_size,
+                    "file_type": file_upload_request.file_type,
+                    "processing_status": ProcessingStatus.PENDING,
+                    "clerk_id": current_user_clerk_id,
+                }
+            )
             .execute()
         )
 
-        if not project_settings_ownership_verification_result.data:
+        if not document_creation_result.data:
+            logger.error("document_record_creation_failed", filename=file_upload_request.filename, reason="no_data_returned")
             raise HTTPException(
-                status_code=404,
-                detail="Project settings not found for this project",
+                status_code=422,
+                detail="Failed to create project document - invalid data provided",
             )
 
-        project_settings_update_data = (
-            settings.model_dump()  # Pydantic modal to dictionary conversion
-        )
-        project_settings_update_result = (
-            supabase.table("project_settings")
-            .update(project_settings_update_data)
-            .eq("project_id", project_id)
-            .execute()
-        )
-
-        if not project_settings_update_result.data:
-            raise HTTPException(
-                status_code=422, detail="Failed to update project settings"
-            )
-
+        logger.info("upload_url_generated_successfully", document_id=document_creation_result.data[0]["id"], s3_key=s3_key)
         return {
-            "message": "Project settings updated successfully",
-            "data": project_settings_update_result.data[0],
-        }
-
-    except HTTPException as e:
-        raise e
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal server error occurred while updating project {project_id} settings: {str(e)}",
-        )
-
-
-@router.post("/{project_id}/chats/{chat_id}/messages")
-async def send_message(
-    project_id: str,
-    chat_id: str,
-    message: MessageCreate,
-    current_user_clerk_id: str = Depends(get_current_user_clerk_id),
-):
-    """
-    ! Logic Flow:
-    * 1. Get current user clerk_id
-    * 2. Insert the message into the database.
-    * 3. Retrieval
-    * 4. Generation (Retrieved Context + User Message)
-    * 5. Insert the AI Response into the database.
-    """
-    try:
-        # Step 1 : Insert the message into the database.
-        message_content = message.content
-        message_insert_data = {
-            "content": message_content,
-            "chat_id": chat_id,
-            "clerk_id": current_user_clerk_id,
-            "role": MessageRole.USER.value,
-        }
-        message_creation_result = (
-            supabase.table("messages").insert(message_insert_data).execute()
-        )
-
-        if not message_creation_result.data:
-            raise HTTPException(status_code=422, detail="Failed to create message")
-        
-        current_message_id=message_creation_result.data[0]["id"]
-
-        try:
-            project_settings= (await get_project_settings(project_id)).get("data", {})
-            agent_type=project_settings.get('agent_type','simple')
-        except Exception as e:
-            agent_type='agentic'
-
-
-        chat_history=get_chat_history(chat_id,exclude_message_id=current_message_id)
-
-        # invoke agent
-
-        if agent_type=='simple':
-            print(f"simple mode enabled")
-            agent= create_simple_rag_agent(
-                project_id=project_id,
-                model="gpt-4o-mini",
-                chat_history=chat_history
-            )
-        elif agent_type=='agentic':
-            print(f"agentic mode enabled")
-            agent= create_supervisor_agent(
-                project_id=project_id,
-                model="gpt-4o",
-                chat_history=chat_history
-            )
-        
-
-        result=agent.invoke({
-            "messages":[{"role":"user","content":message_content}]
-        })
-
-
-        final_response = result["messages"][-1].content
-        citations=result.get("citations",[])
-
-        # Step 5: Insert the AI Response into the database.
-        ai_response_insert_data = {
-            "content": final_response,
-            "chat_id": chat_id,
-            "clerk_id": current_user_clerk_id,
-            "role": MessageRole.ASSISTANT.value,
-            "citations": citations,
-        }
-        ai_response_creation_result = (
-            supabase.table("messages").insert(ai_response_insert_data).execute()
-        )
-        if not ai_response_creation_result.data:
-            raise HTTPException(status_code=422, detail="Failed to create AI response")
-
-        return {
-            "message": "Message created successfully",
+            "message": "Upload presigned url generated successfully",
             "data": {
-                "userMessage": message_creation_result.data[0],
-                "aiMessage": ai_response_creation_result.data[0],
+                "upload_url": presigned_url,
+                "s3_key": s3_key,
+                "document": document_creation_result.data[0],
             },
         }
 
@@ -481,7 +171,334 @@ async def send_message(
         raise e
 
     except Exception as e:
+        logger.error("upload_url_generation_error", filename=file_upload_request.filename, error=str(e), exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"An internal server error occurred while creating message: {str(e)}",
+            detail=f"An internal server error occurred while generating upload presigned url for {project_id}: {str(e)}",
+        )
+
+
+@router.post("/{project_id}/files/confirm")
+async def confirm_file_upload_to_s3(
+    project_id: str,
+    confirm_file_upload_request: dict,
+    current_user_clerk_id: str = Depends(get_current_user_clerk_id),
+):
+    """
+    ! Logic Flow:
+    * 1. Verify S3 key is provided
+    * 2. Verify file exists in database
+    * 3. Update file status to "queued"
+    * 4. Perform Celery - RAG Ingestion Task
+    * 5. Update the project document record with the task_id
+    * 6. Return successfully confirmed file upload data
+    """
+    set_project_id(project_id)
+    set_user_id(current_user_clerk_id)
+    try:
+        s3_key = confirm_file_upload_request.get("s3_key")
+        logger.info("confirming_file_upload", s3_key=s3_key)
+        if not s3_key:
+            logger.warning("s3_key_missing")
+            raise HTTPException(
+                status_code=400,
+                detail="S3 key is required",
+            )
+
+        # Verify file exists in database
+        document_verification_result = (
+            supabase.table("project_documents")
+            .select("id")
+            .eq("s3_key", s3_key)
+            .eq("project_id", project_id)
+            .eq("clerk_id", current_user_clerk_id)
+            .execute()
+        )
+
+        if not document_verification_result.data:
+            logger.warning("file_not_found_for_confirmation", s3_key=s3_key)
+            raise HTTPException(
+                status_code=404,
+                detail="File not found or you don't have permission to confirm upload to S3 for this file",
+            )
+
+        # Update file status to "queued"
+        document_update_result = (
+            supabase.table("project_documents")
+            .update(
+                {
+                    "processing_status": ProcessingStatus.QUEUED,
+                }
+            )
+            .eq("s3_key", s3_key)
+            .execute()
+        )
+
+        # ! Celery - Starts Background Processing - RAG Ingestion Task
+        document_id = document_update_result.data[0]["id"]
+        task_result = perform_rag_ingestion_task.delay(document_id)
+        task_id = task_result.id
+        logger.info("rag_ingestion_task_queued", document_id=document_id, task_id=task_id)
+
+        document_update_result = (
+            supabase.table("project_documents")
+            .update(
+                {
+                    "task_id": task_id,
+                }
+            )
+            .eq("id", document_id)
+            .execute()
+        )
+        if not document_update_result.data:
+            logger.error("task_id_update_failed", document_id=document_id, task_id=task_id, reason="no_data_returned")
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to update project document record with task_id",
+            )
+
+        logger.info("file_upload_confirmed_successfully", document_id=document_id, task_id=task_id)
+        return {
+            "message": "File upload to S3 confirmed successfully And Started Background Pre-Processing of this file",
+            "data": document_update_result.data[0],
+        }
+
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+        logger.error("file_confirmation_error", s3_key=s3_key, error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An internal server error occurred while confirming upload to S3 for {project_id}: {str(e)}",
+        )
+
+
+@router.post("/{project_id}/urls")
+async def process_url(
+    project_id: str,
+    url: UrlRequest,
+    current_user_clerk_id: str = Depends(get_current_user_clerk_id),
+):
+    """
+    ! Logic Flow:
+    * 1. Validate URL
+    * 2. Add website URL to database
+    * 3. Start background pre-processing of this URL
+    * 4. Return successfully processed URL data
+    """
+    set_project_id(project_id)
+    set_user_id(current_user_clerk_id)
+    try:
+        # Validate URL
+        url = url.url
+        if url.startswith("http://") or url.startswith("https://"):
+            url = url
+        else:
+            url = f"https://{url}"
+
+        logger.info("processing_url", url=url)
+        if not validate_url(url):
+            logger.warning("invalid_url", url=url)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid URL",
+            )
+
+        # Add website Url to database
+        document_creation_result = (
+            supabase.table("project_documents")
+            .insert(
+                {
+                    "project_id": project_id,
+                    "filename": url,
+                    "s3_key": "",
+                    "file_size": 0,
+                    "file_type": "text/html",
+                    "processing_status": ProcessingStatus.QUEUED,
+                    "clerk_id": current_user_clerk_id,
+                    "source_type": "url",
+                    "source_url": url,
+                }
+            )
+            .execute()
+        )
+
+        if not document_creation_result.data:
+            logger.error("url_document_creation_failed", url=url, reason="no_data_returned")
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to create project document with URL Record - invalid data provided",
+            )
+
+        # ! Celery - Starts Background Processing - RAG Ingestion Task
+        document_id = document_creation_result.data[0]["id"]
+        task_result = perform_rag_ingestion_task.delay(document_id)
+        task_id = task_result.id
+        logger.info("url_ingestion_task_queued", document_id=document_id, task_id=task_id, url=url)
+
+        document_update_result = (
+            supabase.table("project_documents")
+            .update(
+                {
+                    "task_id": task_id,
+                }
+            )
+            .eq("id", document_id)
+            .execute()
+        )
+
+        if not document_update_result.data:
+            logger.error("url_task_id_update_failed", document_id=document_id, task_id=task_id, reason="no_data_returned")
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to update project document record with task_id",
+            )
+
+        logger.info("url_processed_successfully", document_id=document_id, url=url, task_id=task_id)
+        return {
+            "message": "Website URL added to database successfully And Started Background Pre-Processing of this URL",
+            "data": document_creation_result.data[0],
+        }
+
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+        logger.error("url_processing_error", url=url, error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An internal server error occurred while processing urls for {project_id}: {str(e)}",
+        )
+
+
+@router.delete("/{project_id}/files/{file_id}")
+async def delete_project_document(
+    project_id: str,
+    file_id: str,
+    current_user_clerk_id: str = Depends(get_current_user_clerk_id),
+):
+    """
+    ! Logic Flow:
+    * 1. Verify document exists and belongs to the current user and take complete project document record
+    * 2. Delete file from S3 (only for actual files, not for URLs)
+    * 3. Delete document from database
+    * 4. Return successfully deleted document data
+    """
+    set_project_id(project_id)
+    set_user_id(current_user_clerk_id)
+    try:
+        logger.info("deleting_document", file_id=file_id)
+        # Verify document exists and belongs to the current user and Take complete project document record
+        document_ownership_verification_result = (
+            supabase.table("project_documents")
+            .select("*")
+            .eq("id", file_id)
+            .eq("project_id", project_id)
+            .eq("clerk_id", current_user_clerk_id)
+            .execute()
+        )
+
+        if not document_ownership_verification_result.data:
+            logger.warning("document_not_found_for_deletion", file_id=file_id)
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found or you don't have permission to delete this document",
+            )
+
+        # Delete file from S3 (only for actual files, not for URLs)
+        s3_key = document_ownership_verification_result.data[0]["s3_key"]
+        if s3_key:
+            logger.info("deleting_from_s3", file_id=file_id, s3_key=s3_key)
+            s3_client.delete_object(Bucket=appConfig["s3_bucket_name"], Key=s3_key)
+
+        # Delete document from database
+        document_deletion_result = (
+            supabase.table("project_documents")
+            .delete()
+            .eq("id", file_id)
+            .eq("project_id", project_id)
+            .eq("clerk_id", current_user_clerk_id)
+            .execute()
+        )
+
+        if not document_deletion_result.data:
+            logger.error("document_deletion_failed", file_id=file_id, reason="no_data_returned")
+            raise HTTPException(
+                status_code=404,
+                detail="Failed to delete document",
+            )
+
+        logger.info("document_deleted_successfully", file_id=file_id)
+        return {
+            "message": "Document deleted successfully",
+            "data": document_deletion_result.data[0],
+        }
+
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+        logger.error("document_deletion_error", file_id=file_id, error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An internal server error occurred while deleting project document {file_id} for {project_id}: {str(e)}",
+        )
+
+
+@router.get("/{project_id}/files/{file_id}/chunks")
+async def get_project_document_chunks(
+    project_id: str,
+    file_id: str,
+    current_user_clerk_id: str = Depends(get_current_user_clerk_id),
+):
+    """
+    ! Logic Flow:
+    * 1. Verify document exists and belongs to the current user and Take complete project document record
+    * 2. Get project document chunks
+    * 3. Return project document chunks data
+    """
+    set_project_id(project_id)
+    set_user_id(current_user_clerk_id)
+    try:
+        logger.info("fetching_document_chunks", file_id=file_id)
+        # Verify document exists and belongs to the current user and Take complete project document record
+        document_ownership_verification_result = (
+            supabase.table("project_documents")
+            .select("*")
+            .eq("id", file_id)
+            .eq("project_id", project_id)
+            .eq("clerk_id", current_user_clerk_id)
+            .execute()
+        )
+
+        if not document_ownership_verification_result.data:
+            logger.warning("document_not_found_for_chunks", file_id=file_id)
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found or you don't have permission to delete this document",
+            )
+
+        document_chunks_result = (
+            supabase.table("document_chunks")
+            .select("*")
+            .eq("document_id", file_id)
+            .order("chunk_index")
+            .execute()
+        )
+
+        logger.info("document_chunks_retrieved", file_id=file_id, chunk_count=len(document_chunks_result.data or []))
+        return {
+            "message": "Project document chunks retrieved successfully",
+            "data": document_chunks_result.data or [],
+        }
+
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+        logger.error("document_chunks_retrieval_error", file_id=file_id, error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An internal server error occurred while getting project document chunks for {file_id} for {project_id}: {str(e)}",
         )
