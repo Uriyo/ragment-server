@@ -28,6 +28,7 @@ stripe = "^14.1.0"
 pydantic = {extras = ["email"], version = "^2.12.5"}
 ragas = "^0.4.1"
 openai = "^2.14.0"
+structlog = "^25.5.0"
 
 
 [build-system]

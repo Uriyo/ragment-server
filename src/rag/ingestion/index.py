@@ -125,7 +125,7 @@ def update_status_in_database(
         logger.debug(
                 "merged_processing_details",
                 document_id=document_id,
-                details_keys=list(details.keys())
+                details_keys=list(details.keys()) if details else []
             )
         
         # Update the project document record with the new details
