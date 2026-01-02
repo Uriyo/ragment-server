@@ -1,35 +1,74 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Header
 from src.services.supabase import supabase
 from src.config.logging import get_logger
+from svix.webhooks import Webhook, WebhookVerificationError
+import os
 
 logger = get_logger(__name__)
-
 router = APIRouter(tags=["userRoutes"])
 
-
 @router.post("/create")
-async def create_user(clerk_webhook_data: dict):
+async def create_user(
+    request: Request,
+    svix_id: str = Header(None, alias="svix-id"),
+    svix_timestamp: str = Header(None, alias="svix-timestamp"),
+    svix_signature: str = Header(None, alias="svix-signature"),
+):
     """
-    Payload structure : https://clerk.com/docs/guides/development/webhooks/overview#payload-structure
-
-    Logic Flow
-    * 1. Validate webhook payload structure
-    * 2. Check event type - our case type - "user.created"
-    * 3. Extract and validate user data
-    * 4. Extract and validate clerk_id
-    * 5. Check if user already exists to prevent duplicates
-    * 6. Create new user in database
-    * 7. Return success message and user data
-
+    Clerk Webhook Handler with Signature Verification
+    
+    Payload structure: https://clerk.com/docs/guides/development/webhooks/overview#payload-structure
+    
+    Logic Flow:
+    * 1. Verify webhook signature from Clerk
+    * 2. Validate webhook payload structure
+    * 3. Check event type - our case type - "user.created"
+    * 4. Extract and validate user data
+    * 5. Extract and validate clerk_id
+    * 6. Check if user already exists to prevent duplicates
+    * 7. Create new user in database
+    * 8. Return success message and user data
     """
     try:
-        logger.info("webhook_received", event_type=clerk_webhook_data.get("type") if isinstance(clerk_webhook_data, dict) else None)
+        # Get webhook secret from environment
+        webhook_secret = os.getenv("CLERK_WEBHOOK_SECRET")
+        if not webhook_secret:
+            logger.error("webhook_secret_missing")
+            raise HTTPException(
+                status_code=500, 
+                detail="Webhook secret not configured"
+            )
+
+        # Get raw body for signature verification
+        body = await request.body()
+        body_str = body.decode("utf-8")
+
+        # Verify webhook signature
+        try:
+            wh = Webhook(webhook_secret)
+            clerk_webhook_data = wh.verify(body_str, {
+                "svix-id": svix_id,
+                "svix-timestamp": svix_timestamp,
+                "svix-signature": svix_signature,
+            })
+        except WebhookVerificationError as e:
+            logger.warning("webhook_verification_failed", error=str(e))
+            raise HTTPException(
+                status_code=401, 
+                detail="Webhook signature verification failed"
+            )
+
+        logger.info(
+            "webhook_received", 
+            event_type=clerk_webhook_data.get("type") if isinstance(clerk_webhook_data, dict) else None
+        )
 
         # Validate webhook payload structure
         if not isinstance(clerk_webhook_data, dict):
             logger.warning("invalid_webhook_payload", payload_type=type(clerk_webhook_data).__name__)
             raise HTTPException(
-                status_code=400, detail="Invalid webhook payload format"
+                status_code=400, 
+                detail="Invalid webhook payload format"
             )
 
         # Check event type
@@ -41,7 +80,11 @@ async def create_user(clerk_webhook_data: dict):
         # Extract and validate user data
         user_data = clerk_webhook_data.get("data")
         if not user_data or not isinstance(user_data, dict):
-            logger.warning("invalid_user_data", has_data=bool(user_data), data_type=type(user_data).__name__ if user_data else None)
+            logger.warning(
+                "invalid_user_data", 
+                has_data=bool(user_data), 
+                data_type=type(user_data).__name__ if user_data else None
+            )
             raise HTTPException(
                 status_code=400,
                 detail="Missing or invalid user data in webhook payload",
@@ -50,9 +93,14 @@ async def create_user(clerk_webhook_data: dict):
         # Extract and validate clerk_id
         clerk_id = user_data.get("id")
         if not clerk_id or not isinstance(clerk_id, str):
-            logger.warning("invalid_clerk_id", has_id=bool(clerk_id), id_type=type(clerk_id).__name__ if clerk_id else None)
+            logger.warning(
+                "invalid_clerk_id", 
+                has_id=bool(clerk_id), 
+                id_type=type(clerk_id).__name__ if clerk_id else None
+            )
             raise HTTPException(
-                status_code=400, detail="Missing or invalid clerk_id in user data"
+                status_code=400, 
+                detail="Missing or invalid clerk_id in user data"
             )
 
         logger.info("creating_user", user_id=clerk_id)
@@ -64,27 +112,41 @@ async def create_user(clerk_webhook_data: dict):
             .eq("clerk_id", clerk_id)
             .execute()
         )
+
         if existing_user.data:
             logger.info("user_already_exists", user_id=clerk_id)
             return {"message": "User already exists", "clerk_id": clerk_id}
 
         # Create new user in database
         result = supabase.table("users").insert({"clerk_id": clerk_id}).execute()
+
         if not result.data:
-            logger.error("user_creation_failed", user_id=clerk_id, reason="no_data_returned")
+            logger.error(
+                "user_creation_failed", 
+                user_id=clerk_id, 
+                reason="no_data_returned"
+            )
             raise HTTPException(
-                status_code=500, detail="Failed to create user in database"
+                status_code=500, 
+                detail="Failed to create user in database"
             )
 
-        logger.info("user_created_successfully", user_id=clerk_id, db_user_id=result.data[0].get("id"))
+        logger.info(
+            "user_created_successfully", 
+            user_id=clerk_id, 
+            db_user_id=result.data[0].get("id")
+        )
+        
         return {"message": "User created successfully", "user": result.data[0]}
 
     except HTTPException as e:
         raise e
-
+    except WebhookVerificationError as e:
+        logger.error("webhook_verification_error", error=str(e))
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
     except Exception as e:
         logger.error("webhook_processing_error", error=str(e), exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error occurred while processing webhook {str(e)}",
+            detail=f"Internal server error occurred while processing webhook: {str(e)}",
         )
