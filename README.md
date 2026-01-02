@@ -2,6 +2,10 @@
 
 A powerful Python backend service for the Notebook LLM Clone application, featuring document processing, AI-powered retrieval, and real-time chat capabilities.
 
+<img width="843" height="587" alt="Screenshot 2026-01-02 at 10 05 43 PM" src="https://github.com/user-attachments/assets/5a536c48-5ba3-477c-9cc7-7be6523cbff6" />
+
+
+
 ## Features
 
 - 📄 **Advanced Document Processing** - Support for PDFs, images, and various document formats
