@@ -21,10 +21,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Middleware
-app.add_middleware(LoggingMiddleware)
-
-# Configure CORS
+# Configure CORS (must be added first, before other middleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -36,6 +33,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Middleware
+app.add_middleware(LoggingMiddleware)
 logger.info("middleware_configured")
 
 app.include_router(userRoutes, prefix="/api/user")
